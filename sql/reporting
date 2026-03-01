@@ -1,0 +1,257 @@
+-- =============================================================================
+-- PROJECT 3 — Healthcare ETL Validation & Reconciliation
+-- File: 04_reporting_outputs.sql
+-- Platform: PostgreSQL 15
+-- Description: Reporting layer — DQ dashboard, financial recon, exception
+--   detail report, and 5 validation sanity checks.
+--   Run after 03_dq_engine.sql.
+-- =============================================================================
+
+-- =============================================================================
+-- STEP 1: FINANCIAL RECONCILIATION SUMMARY TABLE
+-- Batch-level: rowcount, total charges, total payments
+-- =============================================================================
+
+INSERT INTO recon_summary
+    (recon_id, load_batch_id, recon_type,
+     source_value, target_value, variance,
+     tolerance, within_tolerance, run_dt)
+
+-- Rowcount recon: staging header vs curated header
+SELECT
+    ROW_NUMBER() OVER (ORDER BY s.load_batch_id) + 100,
+    s.load_batch_id,
+    'ROWCOUNT: STG_HEADER vs CURATED_HEADER',
+    COUNT(DISTINCT s.stg_claim_id)::NUMERIC,
+    COUNT(DISTINCT c.claim_id)::NUMERIC,
+    (COUNT(DISTINCT s.stg_claim_id) - COUNT(DISTINCT c.claim_id))::NUMERIC,
+    0,
+    COUNT(DISTINCT s.stg_claim_id) = COUNT(DISTINCT c.claim_id),
+    NOW()
+FROM stg_837_claim_header s
+LEFT JOIN curated_claim_header c
+       ON s.load_batch_id = c.load_batch_id
+GROUP BY s.load_batch_id
+
+UNION ALL
+
+-- Financial recon: total staging charges vs total curated charges
+SELECT
+    ROW_NUMBER() OVER (ORDER BY s.load_batch_id) + 200,
+    s.load_batch_id,
+    'FINANCIAL: STG_CHARGE vs CURATED_CHARGE',
+    SUM(s.total_charge_amt),
+    COALESCE(SUM(c.total_charge_amt), 0),
+    ABS(SUM(s.total_charge_amt) - COALESCE(SUM(c.total_charge_amt), 0)),
+    0.01,
+    ABS(SUM(s.total_charge_amt) - COALESCE(SUM(c.total_charge_amt), 0)) <= 0.01,
+    NOW()
+FROM stg_837_claim_header s
+LEFT JOIN curated_claim_header c
+       ON s.load_batch_id = c.load_batch_id
+GROUP BY s.load_batch_id
+
+UNION ALL
+
+-- Payment recon: total staged payments vs total curated payments
+SELECT
+    ROW_NUMBER() OVER (ORDER BY p.load_batch_id) + 300,
+    p.load_batch_id,
+    'PAYMENT: STG_PAID vs CURATED_PAID',
+    SUM(p.paid_amt),
+    COALESCE(SUM(cp.paid_amt), 0),
+    ABS(SUM(p.paid_amt) - COALESCE(SUM(cp.paid_amt), 0)),
+    0.01,
+    ABS(SUM(p.paid_amt) - COALESCE(SUM(cp.paid_amt), 0)) <= 0.01,
+    NOW()
+FROM stg_835_payment p
+LEFT JOIN curated_payment cp
+       ON p.load_batch_id = cp.load_batch_id
+GROUP BY p.load_batch_id;
+
+
+-- =============================================================================
+-- QUERY 1: DQ DASHBOARD SUMMARY
+-- One row per rule per batch — the main executive-level view
+-- =============================================================================
+
+SELECT
+    r.dq_rule_id,
+    d.rule_name,
+    d.severity,
+    r.load_batch_id,
+    r.total_checked,
+    r.failed_count,
+    r.passed_count,
+    CASE WHEN r.pass_flag THEN 'PASS' ELSE 'FAIL' END  AS status,
+    ROUND(r.passed_count::NUMERIC /
+          NULLIF(r.total_checked,0) * 100, 1)          AS pass_pct,
+    r.notes,
+    r.run_dt
+FROM dq_result_fact r
+JOIN dq_rule_dim   d ON r.dq_rule_id = d.dq_rule_id
+ORDER BY
+    CASE d.severity
+        WHEN 'CRITICAL' THEN 1
+        WHEN 'HIGH'     THEN 2
+        WHEN 'MEDIUM'   THEN 3
+        ELSE 4 END,
+    r.dq_rule_id,
+    r.load_batch_id;
+
+
+-- =============================================================================
+-- QUERY 2: DQ SUMMARY PIVOT — rules as rows, batches as columns
+-- Shows pass/fail side-by-side for both batches
+-- =============================================================================
+
+SELECT
+    r.dq_rule_id,
+    d.rule_name,
+    d.severity,
+    MAX(CASE WHEN r.load_batch_id = 'BATCH_2022_01'
+             THEN CASE WHEN r.pass_flag THEN 'PASS' ELSE 'FAIL' END END) AS batch_2022_status,
+    MAX(CASE WHEN r.load_batch_id = 'BATCH_2022_01'
+             THEN r.failed_count END)                                      AS batch_2022_failures,
+    MAX(CASE WHEN r.load_batch_id = 'BATCH_2023_01'
+             THEN CASE WHEN r.pass_flag THEN 'PASS' ELSE 'FAIL' END END) AS batch_2023_status,
+    MAX(CASE WHEN r.load_batch_id = 'BATCH_2023_01'
+             THEN r.failed_count END)                                      AS batch_2023_failures
+FROM dq_result_fact r
+JOIN dq_rule_dim   d ON r.dq_rule_id = d.dq_rule_id
+GROUP BY r.dq_rule_id, d.rule_name, d.severity
+ORDER BY
+    CASE d.severity
+        WHEN 'CRITICAL' THEN 1
+        WHEN 'HIGH'     THEN 2
+        WHEN 'MEDIUM'   THEN 3
+        ELSE 4 END,
+    r.dq_rule_id;
+
+
+-- =============================================================================
+-- QUERY 3: TOP EXCEPTIONS — all failing records with reason
+-- =============================================================================
+
+SELECT
+    e.exception_id,
+    e.dq_rule_id,
+    d.rule_name,
+    d.severity,
+    e.load_batch_id,
+    e.record_key,
+    e.exception_reason,
+    e.sample_payload
+FROM dq_exception_detail e
+JOIN dq_rule_dim          d ON e.dq_rule_id = d.dq_rule_id
+ORDER BY
+    CASE d.severity
+        WHEN 'CRITICAL' THEN 1
+        WHEN 'HIGH'     THEN 2
+        WHEN 'MEDIUM'   THEN 3
+        ELSE 4 END,
+    e.dq_rule_id,
+    e.load_batch_id;
+
+
+-- =============================================================================
+-- QUERY 4: FINANCIAL RECONCILIATION REPORT
+-- =============================================================================
+
+SELECT
+    load_batch_id,
+    recon_type,
+    source_value,
+    target_value,
+    variance,
+    tolerance,
+    CASE WHEN within_tolerance THEN 'PASS' ELSE 'FAIL' END AS status
+FROM recon_summary
+ORDER BY load_batch_id, recon_type;
+
+
+-- =============================================================================
+-- QUERY 5: EXCEPTION COUNT BY RULE AND SEVERITY
+-- Useful for prioritizing remediation work
+-- =============================================================================
+
+SELECT
+    e.dq_rule_id,
+    d.rule_name,
+    d.severity,
+    COUNT(*)  AS total_exceptions,
+    COUNT(DISTINCT e.load_batch_id) AS batches_affected
+FROM dq_exception_detail e
+JOIN dq_rule_dim          d ON e.dq_rule_id = d.dq_rule_id
+GROUP BY e.dq_rule_id, d.rule_name, d.severity
+ORDER BY
+    CASE d.severity
+        WHEN 'CRITICAL' THEN 1
+        WHEN 'HIGH'     THEN 2
+        WHEN 'MEDIUM'   THEN 3
+        ELSE 4 END,
+    total_exceptions DESC;
+
+
+-- =============================================================================
+-- QUERY 6: BATCH HEALTH SCORECARD
+-- Overall pass rate per batch — the daily ops view
+-- =============================================================================
+
+SELECT
+    r.load_batch_id,
+    COUNT(*)                                          AS rules_checked,
+    SUM(CASE WHEN r.pass_flag THEN 1 ELSE 0 END)      AS rules_passed,
+    SUM(CASE WHEN NOT r.pass_flag THEN 1 ELSE 0 END)  AS rules_failed,
+    SUM(CASE WHEN NOT r.pass_flag AND d.severity = 'CRITICAL'
+             THEN 1 ELSE 0 END)                       AS critical_failures,
+    SUM(CASE WHEN NOT r.pass_flag AND d.severity = 'HIGH'
+             THEN 1 ELSE 0 END)                       AS high_failures,
+    ROUND(SUM(CASE WHEN r.pass_flag THEN 1 ELSE 0 END)::NUMERIC /
+          COUNT(*) * 100, 1)                          AS overall_pass_pct,
+    SUM(r.failed_count)                               AS total_bad_records
+FROM dq_result_fact r
+JOIN dq_rule_dim   d ON r.dq_rule_id = d.dq_rule_id
+GROUP BY r.load_batch_id
+ORDER BY r.load_batch_id;
+
+
+-- =============================================================================
+-- VALIDATION SANITY CHECKS
+-- =============================================================================
+
+-- Check 1: Every exception must have a matching result row
+SELECT COUNT(*) AS orphan_exceptions
+FROM dq_exception_detail e
+LEFT JOIN dq_result_fact r ON e.dq_result_id = r.dq_result_id
+WHERE r.dq_result_id IS NULL;
+-- Expected: 0
+
+-- Check 2: No result row can have failed_count > total_checked
+SELECT COUNT(*) AS impossible_counts
+FROM dq_result_fact
+WHERE failed_count > total_checked;
+-- Expected: 0
+
+-- Check 3: failed_count + passed_count = total_checked for every row
+SELECT COUNT(*) AS count_mismatch
+FROM dq_result_fact
+WHERE failed_count + passed_count != total_checked;
+-- Expected: 0
+
+-- Check 4: pass_flag is consistent with failed_count
+SELECT COUNT(*) AS inconsistent_pass_flag
+FROM dq_result_fact
+WHERE (pass_flag = TRUE  AND failed_count > 0)
+   OR (pass_flag = FALSE AND failed_count = 0);
+-- Expected: 0
+
+-- Check 5: All 12 DQ rules ran for BATCH_2022_01
+SELECT COUNT(DISTINCT dq_rule_id) AS rules_run_batch_2022
+FROM dq_result_fact
+WHERE load_batch_id = 'BATCH_2022_01';
+-- Expected: 12
+
+-- =============================================================================
+-- END OF REPORTING OUTPUTS
+-- =============================================================================
