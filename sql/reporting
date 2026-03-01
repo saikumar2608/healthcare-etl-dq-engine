@@ -1,10 +1,4 @@
--- =============================================================================
--- PROJECT 3 — Healthcare ETL Validation & Reconciliation
--- File: 04_reporting_outputs.sql
--- Platform: PostgreSQL 15
--- Description: Reporting layer — DQ dashboard, financial recon, exception
---   detail report, and 5 validation sanity checks.
---   Run after 03_dq_engine.sql.
+
 -- =============================================================================
 
 -- =============================================================================
