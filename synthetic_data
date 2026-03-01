@@ -1,0 +1,356 @@
+-- =============================================================================
+-- PROJECT 3 — Healthcare ETL Validation & Reconciliation
+-- File: 02_synthetic_data.sql
+-- Platform: PostgreSQL 15
+-- Description: Synthetic staging + curated data with deliberate errors seeded:
+--   - Orphan claim lines (no header)              → DQ-03
+--   - Orphan payments (no claim)                  → DQ-04
+--   - Overlapping eligibility spans               → DQ-05
+--   - Invalid CPT format (wrong length/chars)     → DQ-06
+--   - Missing/invalid NPI                         → DQ-07
+--   - Negative charge amounts                     → DQ-08
+--   - Future service dates                        → DQ-09
+--   - Member with no eligibility record           → DQ-10
+--   - Invalid ICD-10 format                       → DQ-11
+--   - Duplicate claim control numbers             → DQ-12
+--   - Financial mismatch (header ≠ sum of lines)  → DQ-02
+--   2 batches: BATCH_2022_01 and BATCH_2023_01
+-- =============================================================================
+
+-- ---------------------------------------------------------------------------
+-- DQ RULE REGISTRY
+-- ---------------------------------------------------------------------------
+
+INSERT INTO dq_rule_dim VALUES
+('DQ-01','Rowcount Reconciliation',
+ 'Staging claim header count must match curated claim header count per batch.',
+ 'CRITICAL','stg_837_claim_header / curated_claim_header',
+ 'COUNT(stg) = COUNT(curated) per batch_id',
+ 'SELECT load_batch_id, COUNT(*) FROM stg vs curated GROUP BY batch'),
+
+('DQ-02','Financial Reconciliation',
+ 'Sum of header total_charge_amt must equal sum of line_charge_amt per claim, within $0.01 tolerance.',
+ 'CRITICAL','stg_837_claim_header / stg_837_claim_line',
+ 'ABS(header_total - SUM(line_charges)) <= 0.01 per claim',
+ 'GROUP BY stg_claim_id, compare header vs line sum'),
+
+('DQ-03','Orphan Claim Lines',
+ 'Every claim line must have a matching claim header (stg_claim_id exists in header table).',
+ 'HIGH','stg_837_claim_line',
+ 'No lines with stg_claim_id NOT IN header table',
+ 'LEFT JOIN header, WHERE header IS NULL'),
+
+('DQ-04','Orphan Payments',
+ 'Every 835 payment must match a claim via claim_control_num in the 837 header.',
+ 'HIGH','stg_835_payment',
+ 'No payments with claim_control_num NOT IN stg_837_claim_header',
+ 'LEFT JOIN header on claim_control_num, WHERE header IS NULL'),
+
+('DQ-05','Eligibility Overlap',
+ 'A member cannot have two eligibility spans that overlap on the same dates.',
+ 'HIGH','stg_834_eligibility',
+ 'No member with overlapping cov_start_dt / cov_end_dt spans',
+ 'Self-join on member_external_id, check date range overlap'),
+
+('DQ-06','Invalid CPT/HCPCS Format',
+ 'CPT/HCPCS codes must be exactly 5 alphanumeric characters.',
+ 'HIGH','stg_837_claim_line',
+ 'LENGTH(cpt_hcpcs) = 5 AND cpt_hcpcs ~ ''^[A-Z0-9]{5}$''',
+ 'REGEXP check on cpt_hcpcs column'),
+
+('DQ-07','Missing or Invalid NPI',
+ 'Provider NPI must be present and exactly 10 numeric digits.',
+ 'HIGH','stg_837_claim_header',
+ 'NPI IS NOT NULL AND LENGTH(NPI) = 10 AND NPI ~ ''^[0-9]{10}$''',
+ 'IS NULL check + REGEXP on provider_npi'),
+
+('DQ-08','Negative or Zero Charge Amounts',
+ 'Charge amounts (total and line) must be greater than zero.',
+ 'MEDIUM','stg_837_claim_header / stg_837_claim_line',
+ 'total_charge_amt > 0 AND line_charge_amt > 0',
+ 'WHERE total_charge_amt <= 0 OR line_charge_amt <= 0'),
+
+('DQ-09','Future Service Dates',
+ 'service_from_dt must not be in the future (after current run date).',
+ 'MEDIUM','stg_837_claim_header',
+ 'service_from_dt <= CURRENT_DATE',
+ 'WHERE service_from_dt > CURRENT_DATE'),
+
+('DQ-10','Member Not Found in Eligibility',
+ 'Every claim member_external_id must exist in the eligibility staging table.',
+ 'CRITICAL','stg_837_claim_header',
+ 'All member_external_id values found in stg_834_eligibility',
+ 'LEFT JOIN eligibility, WHERE eligibility IS NULL'),
+
+('DQ-11','Invalid ICD-10 Format',
+ 'ICD-10 codes must match pattern: 1 letter + 2 digits + optional decimal + alphanumeric (3-7 chars total).',
+ 'HIGH','stg_837_claim_line',
+ 'icd10_dx ~ ''^[A-Z][0-9]{2}[.A-Z0-9]*$'' OR icd10_dx IS NULL',
+ 'REGEXP check on icd10_dx column'),
+
+('DQ-12','Duplicate Claim Control Numbers',
+ 'claim_control_num must be unique within a batch in the staging header table.',
+ 'CRITICAL','stg_837_claim_header',
+ 'No duplicate claim_control_num within same load_batch_id',
+ 'GROUP BY claim_control_num, load_batch_id HAVING COUNT(*) > 1');
+
+-- ---------------------------------------------------------------------------
+-- CURATED MEMBERS (reference — must exist before curated claims)
+-- ---------------------------------------------------------------------------
+
+INSERT INTO curated_member_dim VALUES
+(3001,'MBR-001','1965-03-14','M','750','TX','BATCH_2022_01',NOW()),
+(3002,'MBR-002','1972-07-22','F','770','TX','BATCH_2022_01',NOW()),
+(3003,'MBR-003','1958-11-05','M','787','TX','BATCH_2022_01',NOW()),
+(3004,'MBR-004','1980-01-30','F','750','TX','BATCH_2022_01',NOW()),
+(3005,'MBR-005','1945-06-18','M','770','TX','BATCH_2022_01',NOW()),
+(3006,'MBR-006','1968-09-12','F','752','TX','BATCH_2022_01',NOW()),
+(3007,'MBR-007','1975-04-25','M','787','TX','BATCH_2022_01',NOW()),
+(3008,'MBR-008','1990-12-08','F','750','TX','BATCH_2022_01',NOW()),
+(3009,'MBR-009','1955-08-17','M','770','TX','BATCH_2022_01',NOW()),
+(3010,'MBR-010','1963-02-28','F','787','TX','BATCH_2022_01',NOW()),
+(3011,'MBR-011','1978-05-11','M','752','TX','BATCH_2022_01',NOW()),
+(3012,'MBR-012','1960-10-03','F','750','TX','BATCH_2022_01',NOW()),
+(3013,'MBR-013','1948-07-19','M','770','TX','BATCH_2022_01',NOW()),
+(3014,'MBR-014','1970-03-27','F','787','TX','BATCH_2022_01',NOW()),
+(3015,'MBR-015','1985-01-15','M','750','TX','BATCH_2022_01',NOW());
+-- NOTE: MBR-016 intentionally NOT in curated_member_dim → triggers DQ-10
+
+-- ---------------------------------------------------------------------------
+-- STAGING ELIGIBILITY (834) — with deliberate overlap for MBR-005
+-- ---------------------------------------------------------------------------
+
+INSERT INTO stg_834_eligibility VALUES
+-- Clean eligibility records
+(4001,'MBR-001','2022-01-01','2022-12-31','PLAN-TX-01','Commercial','834_2022_01.txt','BATCH_2022_01',NOW()),
+(4002,'MBR-002','2022-01-01','2022-12-31','PLAN-TX-01','Commercial','834_2022_01.txt','BATCH_2022_01',NOW()),
+(4003,'MBR-003','2022-01-01','2022-12-31','PLAN-TX-02','Medicaid',  '834_2022_01.txt','BATCH_2022_01',NOW()),
+(4004,'MBR-004','2022-01-01','2022-12-31','PLAN-TX-01','Commercial','834_2022_01.txt','BATCH_2022_01',NOW()),
+-- MBR-005: OVERLAPPING spans → DQ-05 fires
+(4005,'MBR-005','2022-01-01','2022-08-31','PLAN-TX-02','Medicare',  '834_2022_01.txt','BATCH_2022_01',NOW()),
+(4006,'MBR-005','2022-06-01','2022-12-31','PLAN-TX-03','Medicare',  '834_2022_01.txt','BATCH_2022_01',NOW()), -- overlaps 6/1–8/31
+(4007,'MBR-006','2022-01-01','2022-12-31','PLAN-TX-01','Commercial','834_2022_01.txt','BATCH_2022_01',NOW()),
+(4008,'MBR-007','2022-01-01','2022-12-31','PLAN-TX-02','Medicaid',  '834_2022_01.txt','BATCH_2022_01',NOW()),
+(4009,'MBR-008','2022-01-01','2022-12-31','PLAN-TX-01','Commercial','834_2022_01.txt','BATCH_2022_01',NOW()),
+(4010,'MBR-009','2022-01-01','2022-12-31','PLAN-TX-03','Medicare',  '834_2022_01.txt','BATCH_2022_01',NOW()),
+(4011,'MBR-010','2022-01-01','2022-12-31','PLAN-TX-01','Commercial','834_2022_01.txt','BATCH_2022_01',NOW()),
+(4012,'MBR-011','2022-01-01','2022-12-31','PLAN-TX-02','Medicaid',  '834_2022_01.txt','BATCH_2022_01',NOW()),
+(4013,'MBR-012','2022-01-01','2022-12-31','PLAN-TX-01','Commercial','834_2022_01.txt','BATCH_2022_01',NOW()),
+(4014,'MBR-013','2022-01-01','2022-12-31','PLAN-TX-03','Medicare',  '834_2022_01.txt','BATCH_2022_01',NOW()),
+(4015,'MBR-014','2022-01-01','2022-12-31','PLAN-TX-01','Commercial','834_2022_01.txt','BATCH_2022_01',NOW()),
+(4016,'MBR-015','2022-01-01','2022-12-31','PLAN-TX-02','Medicaid',  '834_2022_01.txt','BATCH_2022_01',NOW()),
+-- 2023 eligibility
+(5001,'MBR-001','2023-01-01','2023-12-31','PLAN-TX-01','Commercial','834_2023_01.txt','BATCH_2023_01',NOW()),
+(5002,'MBR-002','2023-01-01','2023-12-31','PLAN-TX-01','Commercial','834_2023_01.txt','BATCH_2023_01',NOW()),
+(5003,'MBR-003','2023-01-01','2023-12-31','PLAN-TX-02','Medicaid',  '834_2023_01.txt','BATCH_2023_01',NOW()),
+(5004,'MBR-004','2023-01-01','2023-12-31','PLAN-TX-01','Commercial','834_2023_01.txt','BATCH_2023_01',NOW()),
+(5005,'MBR-005','2023-01-01','2023-12-31','PLAN-TX-02','Medicare',  '834_2023_01.txt','BATCH_2023_01',NOW()),
+(5006,'MBR-006','2023-01-01','2023-12-31','PLAN-TX-01','Commercial','834_2023_01.txt','BATCH_2023_01',NOW()),
+(5007,'MBR-007','2023-01-01','2023-12-31','PLAN-TX-02','Medicaid',  '834_2023_01.txt','BATCH_2023_01',NOW()),
+(5008,'MBR-008','2023-01-01','2023-12-31','PLAN-TX-01','Commercial','834_2023_01.txt','BATCH_2023_01',NOW()),
+(5009,'MBR-009','2023-01-01','2023-12-31','PLAN-TX-03','Medicare',  '834_2023_01.txt','BATCH_2023_01',NOW()),
+(5010,'MBR-010','2023-01-01','2023-12-31','PLAN-TX-01','Commercial','834_2023_01.txt','BATCH_2023_01',NOW());
+-- NOTE: MBR-016 has NO eligibility in either batch → supports DQ-10
+
+-- ---------------------------------------------------------------------------
+-- STAGING CLAIM HEADERS (837) — with deliberate errors seeded
+-- ---------------------------------------------------------------------------
+
+INSERT INTO stg_837_claim_header
+    (stg_claim_id, claim_control_num, member_external_id, provider_npi,
+     service_from_dt, service_to_dt, total_charge_amt, claim_type,
+     ingest_file_name, load_batch_id, load_dt)
+VALUES
+-- === BATCH_2022_01 — Clean claims ===
+(1001,'CCN-2022-001','MBR-001','1234567890','2022-02-10','2022-02-15',4500.00,'IP','837_2022_01.txt','BATCH_2022_01',NOW()),
+(1002,'CCN-2022-002','MBR-002','2345678901','2022-03-05','2022-03-10',6200.00,'IP','837_2022_01.txt','BATCH_2022_01',NOW()),
+(1003,'CCN-2022-003','MBR-003','3456789012','2022-04-18','2022-04-22',1800.00,'OP','837_2022_01.txt','BATCH_2022_01',NOW()),
+(1004,'CCN-2022-004','MBR-004','4567890123','2022-05-08','2022-05-08',950.00, 'PROF','837_2022_01.txt','BATCH_2022_01',NOW()),
+(1005,'CCN-2022-005','MBR-005','5678901234','2022-06-01','2022-06-06',4100.00,'IP','837_2022_01.txt','BATCH_2022_01',NOW()),
+(1006,'CCN-2022-006','MBR-006','6789012345','2022-07-15','2022-07-20',7800.00,'IP','837_2022_01.txt','BATCH_2022_01',NOW()),
+(1007,'CCN-2022-007','MBR-007','7890123456','2022-08-03','2022-08-08',3200.00,'OP','837_2022_01.txt','BATCH_2022_01',NOW()),
+(1008,'CCN-2022-008','MBR-008','8901234567','2022-09-12','2022-09-17',4900.00,'IP','837_2022_01.txt','BATCH_2022_01',NOW()),
+(1009,'CCN-2022-009','MBR-009','9012345678','2022-10-22','2022-10-27',6100.00,'IP','837_2022_01.txt','BATCH_2022_01',NOW()),
+(1010,'CCN-2022-010','MBR-010','0123456789','2022-11-08','2022-11-13',3700.00,'OP','837_2022_01.txt','BATCH_2022_01',NOW()),
+-- ERROR: Missing NPI (NULL) → DQ-07
+(1011,'CCN-2022-011','MBR-011',NULL,         '2022-04-05','2022-04-10',4300.00,'IP','837_2022_01.txt','BATCH_2022_01',NOW()),
+-- ERROR: Invalid NPI (only 7 digits) → DQ-07
+(1012,'CCN-2022-012','MBR-012','123456',     '2022-08-14','2022-08-19',3500.00,'OP','837_2022_01.txt','BATCH_2022_01',NOW()),
+-- ERROR: Negative total charge → DQ-08
+(1013,'CCN-2022-013','MBR-013','3456789012', '2022-10-01','2022-10-06',-500.00,'PROF','837_2022_01.txt','BATCH_2022_01',NOW()),
+-- ERROR: Future service date → DQ-09
+(1014,'CCN-2022-014','MBR-014','4567890123', '2027-01-15','2027-01-20',5100.00,'IP','837_2022_01.txt','BATCH_2022_01',NOW()),
+-- ERROR: Member not in eligibility (MBR-016 has no 834 record) → DQ-10
+(1015,'CCN-2022-015','MBR-016','5678901234', '2022-11-20','2022-11-25',7200.00,'IP','837_2022_01.txt','BATCH_2022_01',NOW()),
+-- ERROR: Duplicate claim_control_num within batch → DQ-12
+(1016,'CCN-2022-003','MBR-003','3456789012', '2022-04-18','2022-04-22',1800.00,'OP','837_2022_01.txt','BATCH_2022_01',NOW()),
+-- ERROR: Financial mismatch (header says 2500 but lines sum to 1800) → DQ-02
+(1017,'CCN-2022-016','MBR-001','1234567890', '2022-05-20','2022-05-22',2500.00,'OP','837_2022_01.txt','BATCH_2022_01',NOW()),
+
+-- === BATCH_2023_01 — Clean claims ===
+(2001,'CCN-2023-001','MBR-001','1234567890','2023-01-15','2023-01-20',5200.00,'IP','837_2023_01.txt','BATCH_2023_01',NOW()),
+(2002,'CCN-2023-002','MBR-002','2345678901','2023-02-28','2023-03-04',4100.00,'IP','837_2023_01.txt','BATCH_2023_01',NOW()),
+(2003,'CCN-2023-003','MBR-003','3456789012','2023-04-10','2023-04-15',5600.00,'OP','837_2023_01.txt','BATCH_2023_01',NOW()),
+(2004,'CCN-2023-004','MBR-004','4567890123','2023-06-18','2023-06-23',3900.00,'IP','837_2023_01.txt','BATCH_2023_01',NOW()),
+(2005,'CCN-2023-005','MBR-005','5678901234','2023-07-04','2023-07-09',3400.00,'OP','837_2023_01.txt','BATCH_2023_01',NOW()),
+(2006,'CCN-2023-006','MBR-006','6789012345','2023-08-22','2023-08-27',4800.00,'IP','837_2023_01.txt','BATCH_2023_01',NOW()),
+(2007,'CCN-2023-007','MBR-007','7890123456','2023-09-14','2023-09-19',6900.00,'IP','837_2023_01.txt','BATCH_2023_01',NOW()),
+(2008,'CCN-2023-008','MBR-008','8901234567','2023-10-05','2023-10-10',3600.00,'OP','837_2023_01.txt','BATCH_2023_01',NOW()),
+(2009,'CCN-2023-009','MBR-009','9012345678','2023-11-12','2023-11-17',5300.00,'IP','837_2023_01.txt','BATCH_2023_01',NOW()),
+(2010,'CCN-2023-010','MBR-010','0123456789','2023-03-20','2023-03-25',4400.00,'OP','837_2023_01.txt','BATCH_2023_01',NOW());
+
+-- ---------------------------------------------------------------------------
+-- STAGING CLAIM LINES (837) — with deliberate errors seeded
+-- ---------------------------------------------------------------------------
+
+INSERT INTO stg_837_claim_line
+    (stg_claim_line_id, stg_claim_id, line_num, cpt_hcpcs, icd10_dx,
+     units, line_charge_amt, load_batch_id, load_dt)
+VALUES
+-- Lines for clean claims (matching headers)
+(6001,1001,1,'99213','E11.9', 1,1500.00,'BATCH_2022_01',NOW()),
+(6002,1001,2,'99214','I10',   1,3000.00,'BATCH_2022_01',NOW()),  -- 1500+3000=4500 ✓
+(6003,1002,1,'99223','I50.9', 1,6200.00,'BATCH_2022_01',NOW()),  -- 6200=6200 ✓
+(6004,1003,1,'93000','J18.9', 1, 800.00,'BATCH_2022_01',NOW()),
+(6005,1003,2,'85025','E11.9', 1,1000.00,'BATCH_2022_01',NOW()),  -- 800+1000=1800 ✓
+(6006,1004,1,'99213','Z00.00',1, 950.00,'BATCH_2022_01',NOW()),  -- 950=950 ✓
+(6007,1005,1,'99223','J18.9', 1,4100.00,'BATCH_2022_01',NOW()),  -- 4100=4100 ✓
+(6008,1006,1,'99223','I50.9', 1,4000.00,'BATCH_2022_01',NOW()),
+(6009,1006,2,'93306','E11.9', 1,3800.00,'BATCH_2022_01',NOW()),  -- 4000+3800=7800 ✓
+(6010,1007,1,'99213','N18.3', 1,3200.00,'BATCH_2022_01',NOW()),  -- 3200=3200 ✓
+(6011,1008,1,'99223','E11.65',1,2500.00,'BATCH_2022_01',NOW()),
+(6012,1008,2,'85025','I10',   1,2400.00,'BATCH_2022_01',NOW()),  -- 2500+2400=4900 ✓
+(6013,1009,1,'99223','I50.9', 1,6100.00,'BATCH_2022_01',NOW()),  -- 6100=6100 ✓
+(6014,1010,1,'99213','N18.3', 1,1800.00,'BATCH_2022_01',NOW()),
+(6015,1010,2,'93000','I10',   1,1900.00,'BATCH_2022_01',NOW()),  -- 1800+1900=3700 ✓
+-- Lines for error claims
+(6016,1011,1,'99223','I50.9', 1,4300.00,'BATCH_2022_01',NOW()),  -- header has NULL NPI → DQ-07
+(6017,1012,1,'99213','E11.9', 1,3500.00,'BATCH_2022_01',NOW()),  -- header has bad NPI → DQ-07
+(6018,1013,1,'99213','E11.9', 1,-500.00,'BATCH_2022_01',NOW()),  -- negative line amt → DQ-08
+(6019,1014,1,'99223','N18.3', 1,5100.00,'BATCH_2022_01',NOW()),  -- future date header → DQ-09
+(6020,1015,1,'99223','I50.9', 1,7200.00,'BATCH_2022_01',NOW()),  -- member not in elig → DQ-10
+-- ERROR: Invalid CPT code (4 chars, too short) → DQ-06
+(6021,1016,1,'9921', 'J18.9', 1, 900.00,'BATCH_2022_01',NOW()),
+-- ERROR: Another invalid CPT (special chars) → DQ-06
+(6022,1016,2,'99-14','E11.9', 1, 900.00,'BATCH_2022_01',NOW()),
+-- Lines for financial mismatch claim (header=2500, lines sum to 1800) → DQ-02
+(6023,1017,1,'99213','Z00.00',1, 900.00,'BATCH_2022_01',NOW()),
+(6024,1017,2,'93000','I10',   1, 900.00,'BATCH_2022_01',NOW()),  -- 900+900=1800 ≠ 2500 header ✗
+-- ERROR: Invalid ICD-10 format → DQ-11
+(6025,1007,3,'85025','XYZ',   1,   0.00,'BATCH_2022_01',NOW()),  -- 'XYZ' is invalid ICD-10
+(6026,1008,3,'99214','1234',  1,   0.00,'BATCH_2022_01',NOW()),  -- starts with digit = invalid
+-- ERROR: Orphan line (stg_claim_id 9999 does not exist in header) → DQ-03
+(6027,9999,1,'99213','E11.9', 1,1200.00,'BATCH_2022_01',NOW()),
+(6028,9999,2,'85025','I10',   1, 800.00,'BATCH_2022_01',NOW()),
+-- 2023 batch lines (all clean)
+(7001,2001,1,'99223','I50.9', 1,5200.00,'BATCH_2023_01',NOW()),
+(7002,2002,1,'99223','J18.9', 1,4100.00,'BATCH_2023_01',NOW()),
+(7003,2003,1,'93000','N18.3', 1,2800.00,'BATCH_2023_01',NOW()),
+(7004,2003,2,'85025','E11.9', 1,2800.00,'BATCH_2023_01',NOW()),  -- 2800+2800=5600 ✓
+(7005,2004,1,'99223','J18.9', 1,3900.00,'BATCH_2023_01',NOW()),
+(7006,2005,1,'99213','E11.9', 1,3400.00,'BATCH_2023_01',NOW()),
+(7007,2006,1,'99223','I50.9', 1,4800.00,'BATCH_2023_01',NOW()),
+(7008,2007,1,'99223','I50.9', 1,6900.00,'BATCH_2023_01',NOW()),
+(7009,2008,1,'99213','N18.3', 1,3600.00,'BATCH_2023_01',NOW()),
+(7010,2009,1,'99223','E11.9', 1,5300.00,'BATCH_2023_01',NOW()),
+(7011,2010,1,'99213','J18.9', 1,4400.00,'BATCH_2023_01',NOW());
+
+-- ---------------------------------------------------------------------------
+-- STAGING PAYMENTS (835)
+-- ---------------------------------------------------------------------------
+
+INSERT INTO stg_835_payment
+    (stg_payment_id, claim_control_num, paid_dt, paid_amt,
+     adjustment_amt, denial_reason_code, ingest_file_name, load_batch_id, load_dt)
+VALUES
+-- Clean payments matching 2022 claims
+(8001,'CCN-2022-001','2022-03-10',3825.00,675.00,NULL,'835_2022_01.txt','BATCH_2022_01',NOW()),
+(8002,'CCN-2022-002','2022-04-05',5270.00,930.00,NULL,'835_2022_01.txt','BATCH_2022_01',NOW()),
+(8003,'CCN-2022-003','2022-05-20',1530.00,270.00,NULL,'835_2022_01.txt','BATCH_2022_01',NOW()),
+(8004,'CCN-2022-004','2022-06-08', 807.50,142.50,NULL,'835_2022_01.txt','BATCH_2022_01',NOW()),
+(8005,'CCN-2022-005','2022-07-01',3485.00,615.00,NULL,'835_2022_01.txt','BATCH_2022_01',NOW()),
+(8006,'CCN-2022-006','2022-08-15',6630.00,1170.00,NULL,'835_2022_01.txt','BATCH_2022_01',NOW()),
+(8007,'CCN-2022-007','2022-09-03',2720.00,480.00,NULL,'835_2022_01.txt','BATCH_2022_01',NOW()),
+(8008,'CCN-2022-008','2022-10-12',4165.00,735.00,NULL,'835_2022_01.txt','BATCH_2022_01',NOW()),
+(8009,'CCN-2022-009','2022-11-22',5185.00,915.00,NULL,'835_2022_01.txt','BATCH_2022_01',NOW()),
+(8010,'CCN-2022-010','2022-12-08',3145.00,555.00,NULL,'835_2022_01.txt','BATCH_2022_01',NOW()),
+-- ERROR: Orphan payment — claim control num not in 837 header → DQ-04
+(8011,'CCN-2022-GHOST','2022-06-15',1200.00,0.00,'CO-97','835_2022_01.txt','BATCH_2022_01',NOW()),
+(8012,'CCN-2022-GHOST2','2022-09-20',850.00,0.00,'PR-1','835_2022_01.txt','BATCH_2022_01',NOW()),
+-- Clean payments matching 2023 claims
+(9001,'CCN-2023-001','2023-02-15',4420.00,780.00,NULL,'835_2023_01.txt','BATCH_2023_01',NOW()),
+(9002,'CCN-2023-002','2023-03-28',3485.00,615.00,NULL,'835_2023_01.txt','BATCH_2023_01',NOW()),
+(9003,'CCN-2023-003','2023-05-10',4760.00,840.00,NULL,'835_2023_01.txt','BATCH_2023_01',NOW()),
+(9004,'CCN-2023-004','2023-07-18',3315.00,585.00,NULL,'835_2023_01.txt','BATCH_2023_01',NOW()),
+(9005,'CCN-2023-005','2023-08-04',2890.00,510.00,NULL,'835_2023_01.txt','BATCH_2023_01',NOW()),
+(9006,'CCN-2023-006','2023-09-22',4080.00,720.00,NULL,'835_2023_01.txt','BATCH_2023_01',NOW()),
+(9007,'CCN-2023-007','2023-10-19',5865.00,1035.00,NULL,'835_2023_01.txt','BATCH_2023_01',NOW()),
+(9008,'CCN-2023-008','2023-11-05',3060.00,540.00,NULL,'835_2023_01.txt','BATCH_2023_01',NOW()),
+(9009,'CCN-2023-009','2023-12-17',4505.00,795.00,NULL,'835_2023_01.txt','BATCH_2023_01',NOW()),
+(9010,'CCN-2023-010','2023-04-20',3740.00,660.00,NULL,'835_2023_01.txt','BATCH_2023_01',NOW());
+
+-- ---------------------------------------------------------------------------
+-- CURATED TABLES — promote ONLY the clean 2022 records (10 clean claims)
+-- Errors stay in staging; this simulates the ETL promotion gate
+-- ---------------------------------------------------------------------------
+
+-- Curated eligibility (promote clean records only)
+INSERT INTO curated_eligibility VALUES
+(1,3001,'MBR-001','2022-01-01','2022-12-31','PLAN-TX-01','Commercial','BATCH_2022_01',NOW()),
+(2,3002,'MBR-002','2022-01-01','2022-12-31','PLAN-TX-01','Commercial','BATCH_2022_01',NOW()),
+(3,3003,'MBR-003','2022-01-01','2022-12-31','PLAN-TX-02','Medicaid',  'BATCH_2022_01',NOW()),
+(4,3004,'MBR-004','2022-01-01','2022-12-31','PLAN-TX-01','Commercial','BATCH_2022_01',NOW()),
+(5,3005,'MBR-005','2022-01-01','2022-08-31','PLAN-TX-02','Medicare',  'BATCH_2022_01',NOW()), -- only first span promoted
+(6,3006,'MBR-006','2022-01-01','2022-12-31','PLAN-TX-01','Commercial','BATCH_2022_01',NOW()),
+(7,3007,'MBR-007','2022-01-01','2022-12-31','PLAN-TX-02','Medicaid',  'BATCH_2022_01',NOW()),
+(8,3008,'MBR-008','2022-01-01','2022-12-31','PLAN-TX-01','Commercial','BATCH_2022_01',NOW()),
+(9,3009,'MBR-009','2022-01-01','2022-12-31','PLAN-TX-03','Medicare',  'BATCH_2022_01',NOW()),
+(10,3010,'MBR-010','2022-01-01','2022-12-31','PLAN-TX-01','Commercial','BATCH_2022_01',NOW());
+
+-- Curated claim headers (10 clean claims promoted from BATCH_2022_01)
+INSERT INTO curated_claim_header VALUES
+(1,1001,'CCN-2022-001',3001,'MBR-001','1234567890','2022-02-10','2022-02-15',4500.00,'IP','BATCH_2022_01',NOW()),
+(2,1002,'CCN-2022-002',3002,'MBR-002','2345678901','2022-03-05','2022-03-10',6200.00,'IP','BATCH_2022_01',NOW()),
+(3,1003,'CCN-2022-003',3003,'MBR-003','3456789012','2022-04-18','2022-04-22',1800.00,'OP','BATCH_2022_01',NOW()),
+(4,1004,'CCN-2022-004',3004,'MBR-004','4567890123','2022-05-08','2022-05-08', 950.00,'PROF','BATCH_2022_01',NOW()),
+(5,1005,'CCN-2022-005',3005,'MBR-005','5678901234','2022-06-01','2022-06-06',4100.00,'IP','BATCH_2022_01',NOW()),
+(6,1006,'CCN-2022-006',3006,'MBR-006','6789012345','2022-07-15','2022-07-20',7800.00,'IP','BATCH_2022_01',NOW()),
+(7,1007,'CCN-2022-007',3007,'MBR-007','7890123456','2022-08-03','2022-08-08',3200.00,'OP','BATCH_2022_01',NOW()),
+(8,1008,'CCN-2022-008',3008,'MBR-008','8901234567','2022-09-12','2022-09-17',4900.00,'IP','BATCH_2022_01',NOW()),
+(9,1009,'CCN-2022-009',3009,'MBR-009','9012345678','2022-10-22','2022-10-27',6100.00,'IP','BATCH_2022_01',NOW()),
+(10,1010,'CCN-2022-010',3010,'MBR-010','0123456789','2022-11-08','2022-11-13',3700.00,'OP','BATCH_2022_01',NOW());
+
+-- Curated claim lines (for the 10 clean claims)
+INSERT INTO curated_claim_line VALUES
+(1,1,6001,1,'99213','E11.9', 1,1500.00,'BATCH_2022_01',NOW()),
+(2,1,6002,2,'99214','I10',   1,3000.00,'BATCH_2022_01',NOW()),
+(3,2,6003,1,'99223','I50.9', 1,6200.00,'BATCH_2022_01',NOW()),
+(4,3,6004,1,'93000','J18.9', 1, 800.00,'BATCH_2022_01',NOW()),
+(5,3,6005,2,'85025','E11.9', 1,1000.00,'BATCH_2022_01',NOW()),
+(6,4,6006,1,'99213','Z00.00',1, 950.00,'BATCH_2022_01',NOW()),
+(7,5,6007,1,'99223','J18.9', 1,4100.00,'BATCH_2022_01',NOW()),
+(8,6,6008,1,'99223','I50.9', 1,4000.00,'BATCH_2022_01',NOW()),
+(9,6,6009,2,'93306','E11.9', 1,3800.00,'BATCH_2022_01',NOW()),
+(10,7,6010,1,'99213','N18.3',1,3200.00,'BATCH_2022_01',NOW()),
+(11,8,6011,1,'99223','E11.65',1,2500.00,'BATCH_2022_01',NOW()),
+(12,8,6012,2,'85025','I10',  1,2400.00,'BATCH_2022_01',NOW()),
+(13,9,6013,1,'99223','I50.9',1,6100.00,'BATCH_2022_01',NOW()),
+(14,10,6014,1,'99213','N18.3',1,1800.00,'BATCH_2022_01',NOW()),
+(15,10,6015,2,'93000','I10', 1,1900.00,'BATCH_2022_01',NOW());
+
+-- Curated payments (10 clean payments)
+INSERT INTO curated_payment VALUES
+(1,1,8001,'CCN-2022-001','2022-03-10',3825.00,675.00,'BATCH_2022_01',NOW()),
+(2,2,8002,'CCN-2022-002','2022-04-05',5270.00,930.00,'BATCH_2022_01',NOW()),
+(3,3,8003,'CCN-2022-003','2022-05-20',1530.00,270.00,'BATCH_2022_01',NOW()),
+(4,4,8004,'CCN-2022-004','2022-06-08', 807.50,142.50,'BATCH_2022_01',NOW()),
+(5,5,8005,'CCN-2022-005','2022-07-01',3485.00,615.00,'BATCH_2022_01',NOW()),
+(6,6,8006,'CCN-2022-006','2022-08-15',6630.00,1170.00,'BATCH_2022_01',NOW()),
+(7,7,8007,'CCN-2022-007','2022-09-03',2720.00,480.00,'BATCH_2022_01',NOW()),
+(8,8,8008,'CCN-2022-008','2022-10-12',4165.00,735.00,'BATCH_2022_01',NOW()),
+(9,9,8009,'CCN-2022-009','2022-11-22',5185.00,915.00,'BATCH_2022_01',NOW()),
+(10,10,8010,'CCN-2022-010','2022-12-08',3145.00,555.00,'BATCH_2022_01',NOW());
+
+-- =============================================================================
+-- END OF SYNTHETIC DATA
+-- =============================================================================
