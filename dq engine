@@ -1,0 +1,822 @@
+-- =============================================================================
+-- PROJECT 3 — Healthcare ETL Validation & Reconciliation
+-- File: 03_dq_engine.sql
+-- Platform: PostgreSQL 15
+-- Description: Automated DQ rule engine — executes all 12 rules per batch,
+--   logs results to dq_result_fact, writes failing records to dq_exception_detail.
+--   Run after 02_synthetic_data.sql.
+-- =============================================================================
+
+-- =============================================================================
+-- HELPER: sequence counter for result IDs and exception IDs
+-- =============================================================================
+
+CREATE SEQUENCE IF NOT EXISTS dq_result_seq  START 1;
+CREATE SEQUENCE IF NOT EXISTS dq_excep_seq   START 1;
+
+-- =============================================================================
+-- DQ-01 — ROWCOUNT RECONCILIATION
+-- Staging header count vs curated header count per batch
+-- =============================================================================
+
+WITH stg_counts AS (
+    SELECT load_batch_id, COUNT(*) AS stg_count
+    FROM   stg_837_claim_header
+    GROUP BY load_batch_id
+),
+cur_counts AS (
+    SELECT load_batch_id, COUNT(*) AS cur_count
+    FROM   curated_claim_header
+    GROUP BY load_batch_id
+),
+diff AS (
+    SELECT  s.load_batch_id,
+            s.stg_count,
+            COALESCE(c.cur_count, 0) AS cur_count,
+            s.stg_count - COALESCE(c.cur_count, 0) AS variance
+    FROM    stg_counts s
+    LEFT JOIN cur_counts c USING (load_batch_id)
+)
+INSERT INTO dq_result_fact
+    (dq_result_id, dq_rule_id, load_batch_id, run_dt,
+     total_checked, failed_count, passed_count, pass_flag, notes)
+SELECT
+    NEXTVAL('dq_result_seq'),
+    'DQ-01',
+    load_batch_id,
+    NOW(),
+    stg_count,
+    CASE WHEN variance != 0 THEN 1 ELSE 0 END,
+    CASE WHEN variance  = 0 THEN stg_count ELSE stg_count - 1 END,
+    variance = 0,
+    'Staging count: ' || stg_count ||
+    ' | Curated count: ' || cur_count ||
+    ' | Variance: ' || variance
+FROM diff;
+
+-- DQ-01 exceptions (batches with rowcount mismatch)
+INSERT INTO dq_exception_detail
+    (exception_id, dq_result_id, dq_rule_id, load_batch_id,
+     record_key, exception_reason, sample_payload)
+SELECT
+    NEXTVAL('dq_excep_seq'),
+    r.dq_result_id,
+    'DQ-01',
+    r.load_batch_id,
+    r.load_batch_id,
+    'Rowcount mismatch: staging=' ||
+        (SELECT COUNT(*) FROM stg_837_claim_header s WHERE s.load_batch_id = r.load_batch_id) ||
+        ', curated=' ||
+        (SELECT COUNT(*) FROM curated_claim_header c WHERE c.load_batch_id = r.load_batch_id),
+    '{"rule":"DQ-01","batch":"' || r.load_batch_id || '"}'
+FROM dq_result_fact r
+WHERE r.dq_rule_id = 'DQ-01'
+  AND r.pass_flag  = FALSE;
+
+
+-- =============================================================================
+-- DQ-02 — FINANCIAL RECONCILIATION
+-- Header total_charge_amt vs sum of line_charge_amt (tolerance $0.01)
+-- =============================================================================
+
+WITH line_sums AS (
+    SELECT stg_claim_id,
+           SUM(line_charge_amt) AS line_total
+    FROM   stg_837_claim_line
+    GROUP BY stg_claim_id
+),
+mismatches AS (
+    SELECT  h.stg_claim_id,
+            h.claim_control_num,
+            h.load_batch_id,
+            h.total_charge_amt                         AS header_amt,
+            COALESCE(l.line_total, 0)                  AS line_total,
+            ABS(h.total_charge_amt - COALESCE(l.line_total, 0)) AS variance
+    FROM    stg_837_claim_header h
+    LEFT JOIN line_sums l USING (stg_claim_id)
+    WHERE   ABS(h.total_charge_amt - COALESCE(l.line_total, 0)) > 0.01
+),
+batch_counts AS (
+    SELECT load_batch_id,
+           COUNT(*) AS total_claims,
+           COUNT(m.stg_claim_id) AS failed_claims
+    FROM   stg_837_claim_header h
+    LEFT JOIN mismatches m USING (stg_claim_id, load_batch_id)
+    GROUP BY load_batch_id
+)
+INSERT INTO dq_result_fact
+    (dq_result_id, dq_rule_id, load_batch_id, run_dt,
+     total_checked, failed_count, passed_count, pass_flag, notes)
+SELECT
+    NEXTVAL('dq_result_seq'),
+    'DQ-02',
+    load_batch_id,
+    NOW(),
+    total_claims,
+    failed_claims,
+    total_claims - failed_claims,
+    failed_claims = 0,
+    failed_claims || ' claim(s) with header vs line charge mismatch > $0.01'
+FROM batch_counts;
+
+INSERT INTO dq_exception_detail
+    (exception_id, dq_result_id, dq_rule_id, load_batch_id,
+     record_key, exception_reason, sample_payload)
+SELECT
+    NEXTVAL('dq_excep_seq'),
+    r.dq_result_id,
+    'DQ-02',
+    m.load_batch_id,
+    m.stg_claim_id::TEXT,
+    'Header charge $' || m.header_amt ||
+        ' does not match line sum $' || m.line_total ||
+        ' (variance $' || ROUND(m.variance,2) || ')',
+    '{"claim_control_num":"' || m.claim_control_num ||
+        '","header_amt":' || m.header_amt ||
+        ',"line_total":' || m.line_total || '}'
+FROM (
+    SELECT  h.stg_claim_id,
+            h.claim_control_num,
+            h.load_batch_id,
+            h.total_charge_amt                         AS header_amt,
+            COALESCE(l.line_total, 0)                  AS line_total,
+            ABS(h.total_charge_amt - COALESCE(l.line_total, 0)) AS variance
+    FROM    stg_837_claim_header h
+    LEFT JOIN (SELECT stg_claim_id, SUM(line_charge_amt) AS line_total
+               FROM stg_837_claim_line GROUP BY stg_claim_id) l
+           USING (stg_claim_id)
+    WHERE ABS(h.total_charge_amt - COALESCE(l.line_total, 0)) > 0.01
+) m
+JOIN dq_result_fact r
+  ON r.dq_rule_id     = 'DQ-02'
+ AND r.load_batch_id  = m.load_batch_id;
+
+
+-- =============================================================================
+-- DQ-03 — ORPHAN CLAIM LINES
+-- Lines with stg_claim_id not in any header
+-- =============================================================================
+
+WITH orphans AS (
+    SELECT  l.stg_claim_line_id,
+            l.stg_claim_id,
+            l.load_batch_id
+    FROM    stg_837_claim_line l
+    LEFT JOIN stg_837_claim_header h
+           ON l.stg_claim_id = h.stg_claim_id
+    WHERE   h.stg_claim_id IS NULL
+),
+batch_counts AS (
+    SELECT  l.load_batch_id,
+            COUNT(*)         AS total_lines,
+            COUNT(o.stg_claim_line_id) AS orphan_count
+    FROM    stg_837_claim_line l
+    LEFT JOIN orphans o USING (stg_claim_line_id, load_batch_id)
+    GROUP BY l.load_batch_id
+)
+INSERT INTO dq_result_fact
+    (dq_result_id, dq_rule_id, load_batch_id, run_dt,
+     total_checked, failed_count, passed_count, pass_flag, notes)
+SELECT
+    NEXTVAL('dq_result_seq'),
+    'DQ-03',
+    load_batch_id,
+    NOW(),
+    total_lines,
+    orphan_count,
+    total_lines - orphan_count,
+    orphan_count = 0,
+    orphan_count || ' orphan line(s) with no matching claim header'
+FROM batch_counts;
+
+INSERT INTO dq_exception_detail
+    (exception_id, dq_result_id, dq_rule_id, load_batch_id,
+     record_key, exception_reason, sample_payload)
+SELECT
+    NEXTVAL('dq_excep_seq'),
+    r.dq_result_id,
+    'DQ-03',
+    l.load_batch_id,
+    l.stg_claim_line_id::TEXT,
+    'Claim line references stg_claim_id=' || l.stg_claim_id ||
+        ' which does not exist in stg_837_claim_header',
+    '{"stg_claim_line_id":' || l.stg_claim_line_id ||
+        ',"stg_claim_id":' || l.stg_claim_id || '}'
+FROM stg_837_claim_line l
+LEFT JOIN stg_837_claim_header h ON l.stg_claim_id = h.stg_claim_id
+JOIN dq_result_fact r
+  ON r.dq_rule_id    = 'DQ-03'
+ AND r.load_batch_id = l.load_batch_id
+WHERE h.stg_claim_id IS NULL;
+
+
+-- =============================================================================
+-- DQ-04 — ORPHAN PAYMENTS
+-- 835 payments with claim_control_num not in 837 header
+-- =============================================================================
+
+WITH orphans AS (
+    SELECT  p.stg_payment_id,
+            p.claim_control_num,
+            p.load_batch_id
+    FROM    stg_835_payment p
+    LEFT JOIN stg_837_claim_header h
+           ON p.claim_control_num = h.claim_control_num
+    WHERE   h.claim_control_num IS NULL
+),
+batch_counts AS (
+    SELECT  p.load_batch_id,
+            COUNT(*)       AS total_payments,
+            COUNT(o.stg_payment_id) AS orphan_count
+    FROM    stg_835_payment p
+    LEFT JOIN orphans o USING (stg_payment_id, load_batch_id)
+    GROUP BY p.load_batch_id
+)
+INSERT INTO dq_result_fact
+    (dq_result_id, dq_rule_id, load_batch_id, run_dt,
+     total_checked, failed_count, passed_count, pass_flag, notes)
+SELECT
+    NEXTVAL('dq_result_seq'),
+    'DQ-04',
+    load_batch_id,
+    NOW(),
+    total_payments,
+    orphan_count,
+    total_payments - orphan_count,
+    orphan_count = 0,
+    orphan_count || ' payment(s) with no matching 837 claim'
+FROM batch_counts;
+
+INSERT INTO dq_exception_detail
+    (exception_id, dq_result_id, dq_rule_id, load_batch_id,
+     record_key, exception_reason, sample_payload)
+SELECT
+    NEXTVAL('dq_excep_seq'),
+    r.dq_result_id,
+    'DQ-04',
+    p.load_batch_id,
+    p.stg_payment_id::TEXT,
+    'Payment references claim_control_num=' || p.claim_control_num ||
+        ' which does not exist in stg_837_claim_header',
+    '{"stg_payment_id":' || p.stg_payment_id ||
+        ',"claim_control_num":"' || p.claim_control_num ||
+        '","paid_amt":' || p.paid_amt || '}'
+FROM stg_835_payment p
+LEFT JOIN stg_837_claim_header h ON p.claim_control_num = h.claim_control_num
+JOIN dq_result_fact r
+  ON r.dq_rule_id    = 'DQ-04'
+ AND r.load_batch_id = p.load_batch_id
+WHERE h.claim_control_num IS NULL;
+
+
+-- =============================================================================
+-- DQ-05 — ELIGIBILITY OVERLAP
+-- Member has two spans where cov_start_dt <= other.cov_end_dt AND
+--                              cov_end_dt  >= other.cov_start_dt
+-- =============================================================================
+
+WITH elig_overlaps AS (
+    SELECT DISTINCT
+           a.stg_elig_id,
+           a.member_external_id,
+           a.load_batch_id,
+           a.cov_start_dt    AS span_a_start,
+           a.cov_end_dt      AS span_a_end,
+           b.cov_start_dt    AS span_b_start,
+           b.cov_end_dt      AS span_b_end
+    FROM   stg_834_eligibility a
+    JOIN   stg_834_eligibility b
+        ON a.member_external_id = b.member_external_id
+       AND a.stg_elig_id        < b.stg_elig_id        -- avoid self-join
+       AND a.cov_start_dt      <= b.cov_end_dt
+       AND a.cov_end_dt        >= b.cov_start_dt
+),
+batch_counts AS (
+    SELECT  e.load_batch_id,
+            COUNT(DISTINCT e.member_external_id) AS total_members,
+            COUNT(DISTINCT o.member_external_id) AS overlap_members
+    FROM    stg_834_eligibility e
+    LEFT JOIN elig_overlaps o
+           ON e.stg_elig_id   = o.stg_elig_id
+          AND e.load_batch_id = o.load_batch_id
+    GROUP BY e.load_batch_id
+)
+INSERT INTO dq_result_fact
+    (dq_result_id, dq_rule_id, load_batch_id, run_dt,
+     total_checked, failed_count, passed_count, pass_flag, notes)
+SELECT
+    NEXTVAL('dq_result_seq'),
+    'DQ-05',
+    load_batch_id,
+    NOW(),
+    total_members,
+    overlap_members,
+    total_members - overlap_members,
+    overlap_members = 0,
+    overlap_members || ' member(s) with overlapping eligibility spans'
+FROM batch_counts;
+
+INSERT INTO dq_exception_detail
+    (exception_id, dq_result_id, dq_rule_id, load_batch_id,
+     record_key, exception_reason, sample_payload)
+SELECT DISTINCT
+    NEXTVAL('dq_excep_seq'),
+    r.dq_result_id,
+    'DQ-05',
+    elig_overlap_rows.load_batch_id,
+    elig_overlap_rows.stg_elig_id::TEXT,
+    'Member ' || elig_overlap_rows.member_external_id || ' has overlapping spans: [' ||
+        elig_overlap_rows.span_a_start || ' to ' || elig_overlap_rows.span_a_end || '] overlaps [' ||
+        elig_overlap_rows.span_b_start || ' to ' || elig_overlap_rows.span_b_end || ']',
+    '{"member":"' || elig_overlap_rows.member_external_id ||
+        '","span_a":"' || elig_overlap_rows.span_a_start || '/' || elig_overlap_rows.span_a_end ||
+        '","span_b":"' || elig_overlap_rows.span_b_start || '/' || elig_overlap_rows.span_b_end || '"}'
+FROM (
+    SELECT DISTINCT
+           a.stg_elig_id,
+           a.member_external_id,
+           a.load_batch_id,
+           a.cov_start_dt AS span_a_start,
+           a.cov_end_dt   AS span_a_end,
+           b.cov_start_dt AS span_b_start,
+           b.cov_end_dt   AS span_b_end
+    FROM   stg_834_eligibility a
+    JOIN   stg_834_eligibility b
+        ON a.member_external_id = b.member_external_id
+       AND a.stg_elig_id < b.stg_elig_id
+       AND a.cov_start_dt <= b.cov_end_dt
+       AND a.cov_end_dt   >= b.cov_start_dt
+) elig_overlap_rows
+JOIN dq_result_fact r
+  ON r.dq_rule_id    = 'DQ-05'
+ AND r.load_batch_id = elig_overlap_rows.load_batch_id;
+
+
+-- =============================================================================
+-- DQ-06 — INVALID CPT/HCPCS FORMAT
+-- Must be exactly 5 characters, alphanumeric only
+-- =============================================================================
+
+WITH bad_cpt AS (
+    SELECT  l.stg_claim_line_id,
+            l.stg_claim_id,
+            l.cpt_hcpcs,
+            l.load_batch_id
+    FROM    stg_837_claim_line l
+    WHERE   l.cpt_hcpcs IS NULL
+       OR   LENGTH(l.cpt_hcpcs) != 5
+       OR   l.cpt_hcpcs !~ '^[A-Z0-9]{5}$'
+),
+batch_counts AS (
+    SELECT  l.load_batch_id,
+            COUNT(*)            AS total_lines,
+            COUNT(b.stg_claim_line_id) AS bad_count
+    FROM    stg_837_claim_line l
+    LEFT JOIN bad_cpt b USING (stg_claim_line_id, load_batch_id)
+    GROUP BY l.load_batch_id
+)
+INSERT INTO dq_result_fact
+    (dq_result_id, dq_rule_id, load_batch_id, run_dt,
+     total_checked, failed_count, passed_count, pass_flag, notes)
+SELECT
+    NEXTVAL('dq_result_seq'),
+    'DQ-06',
+    load_batch_id,
+    NOW(),
+    total_lines,
+    bad_count,
+    total_lines - bad_count,
+    bad_count = 0,
+    bad_count || ' line(s) with invalid CPT/HCPCS format'
+FROM batch_counts;
+
+INSERT INTO dq_exception_detail
+    (exception_id, dq_result_id, dq_rule_id, load_batch_id,
+     record_key, exception_reason, sample_payload)
+SELECT
+    NEXTVAL('dq_excep_seq'),
+    r.dq_result_id,
+    'DQ-06',
+    l.load_batch_id,
+    l.stg_claim_line_id::TEXT,
+    'Invalid CPT/HCPCS: "' || COALESCE(l.cpt_hcpcs,'NULL') ||
+        '" (must be 5 alphanumeric chars)',
+    '{"stg_claim_line_id":' || l.stg_claim_line_id ||
+        ',"cpt_hcpcs":"' || COALESCE(l.cpt_hcpcs,'NULL') || '"}'
+FROM stg_837_claim_line l
+JOIN dq_result_fact r
+  ON r.dq_rule_id    = 'DQ-06'
+ AND r.load_batch_id = l.load_batch_id
+WHERE l.cpt_hcpcs IS NULL
+   OR LENGTH(l.cpt_hcpcs) != 5
+   OR l.cpt_hcpcs !~ '^[A-Z0-9]{5}$';
+
+
+-- =============================================================================
+-- DQ-07 — MISSING OR INVALID NPI
+-- NPI must be non-null, exactly 10 numeric digits
+-- =============================================================================
+
+WITH bad_npi AS (
+    SELECT  stg_claim_id,
+            claim_control_num,
+            provider_npi,
+            load_batch_id
+    FROM    stg_837_claim_header
+    WHERE   provider_npi IS NULL
+       OR   LENGTH(provider_npi) != 10
+       OR   provider_npi !~ '^[0-9]{10}$'
+),
+batch_counts AS (
+    SELECT  h.load_batch_id,
+            COUNT(*)          AS total_claims,
+            COUNT(b.stg_claim_id) AS bad_count
+    FROM    stg_837_claim_header h
+    LEFT JOIN bad_npi b USING (stg_claim_id, load_batch_id)
+    GROUP BY h.load_batch_id
+)
+INSERT INTO dq_result_fact
+    (dq_result_id, dq_rule_id, load_batch_id, run_dt,
+     total_checked, failed_count, passed_count, pass_flag, notes)
+SELECT
+    NEXTVAL('dq_result_seq'),
+    'DQ-07',
+    load_batch_id,
+    NOW(),
+    total_claims,
+    bad_count,
+    total_claims - bad_count,
+    bad_count = 0,
+    bad_count || ' claim(s) with missing or invalid NPI'
+FROM batch_counts;
+
+INSERT INTO dq_exception_detail
+    (exception_id, dq_result_id, dq_rule_id, load_batch_id,
+     record_key, exception_reason, sample_payload)
+SELECT
+    NEXTVAL('dq_excep_seq'),
+    r.dq_result_id,
+    'DQ-07',
+    h.load_batch_id,
+    h.stg_claim_id::TEXT,
+    CASE WHEN h.provider_npi IS NULL
+         THEN 'NPI is NULL'
+         ELSE 'NPI "' || h.provider_npi || '" is invalid (must be 10 digits)'
+    END,
+    '{"stg_claim_id":' || h.stg_claim_id ||
+        ',"claim_control_num":"' || h.claim_control_num ||
+        '","provider_npi":"' || COALESCE(h.provider_npi,'NULL') || '"}'
+FROM stg_837_claim_header h
+JOIN dq_result_fact r
+  ON r.dq_rule_id    = 'DQ-07'
+ AND r.load_batch_id = h.load_batch_id
+WHERE h.provider_npi IS NULL
+   OR LENGTH(h.provider_npi) != 10
+   OR h.provider_npi !~ '^[0-9]{10}$';
+
+
+-- =============================================================================
+-- DQ-08 — NEGATIVE OR ZERO CHARGE AMOUNTS
+-- =============================================================================
+
+WITH bad_header AS (
+    SELECT stg_claim_id, load_batch_id, 'header' AS source,
+           total_charge_amt AS bad_amt
+    FROM   stg_837_claim_header
+    WHERE  total_charge_amt <= 0
+),
+bad_line AS (
+    SELECT stg_claim_line_id AS record_id, load_batch_id, 'line' AS source,
+           line_charge_amt AS bad_amt
+    FROM   stg_837_claim_line
+    WHERE  line_charge_amt <= 0
+),
+batch_header_counts AS (
+    SELECT h.load_batch_id,
+           COUNT(*)          AS total,
+           COUNT(b.stg_claim_id) AS bad_count
+    FROM   stg_837_claim_header h
+    LEFT JOIN bad_header b USING (stg_claim_id, load_batch_id)
+    GROUP BY h.load_batch_id
+),
+batch_line_counts AS (
+    SELECT l.load_batch_id,
+           COUNT(*)          AS total,
+           COUNT(b.record_id) AS bad_count
+    FROM   stg_837_claim_line l
+    LEFT JOIN bad_line b ON l.stg_claim_line_id = b.record_id
+                         AND l.load_batch_id = b.load_batch_id
+    GROUP BY l.load_batch_id
+),
+combined AS (
+    SELECT h.load_batch_id,
+           h.total + l.total                   AS total_checked,
+           h.bad_count + l.bad_count           AS failed_count
+    FROM   batch_header_counts h
+    JOIN   batch_line_counts   l USING (load_batch_id)
+)
+INSERT INTO dq_result_fact
+    (dq_result_id, dq_rule_id, load_batch_id, run_dt,
+     total_checked, failed_count, passed_count, pass_flag, notes)
+SELECT
+    NEXTVAL('dq_result_seq'),
+    'DQ-08',
+    load_batch_id,
+    NOW(),
+    total_checked,
+    failed_count,
+    total_checked - failed_count,
+    failed_count = 0,
+    failed_count || ' record(s) with zero or negative charge amounts'
+FROM combined;
+
+INSERT INTO dq_exception_detail
+    (exception_id, dq_result_id, dq_rule_id, load_batch_id,
+     record_key, exception_reason, sample_payload)
+-- Header violations
+SELECT
+    NEXTVAL('dq_excep_seq'),
+    r.dq_result_id,
+    'DQ-08',
+    h.load_batch_id,
+    h.stg_claim_id::TEXT,
+    'Claim header total_charge_amt=' || h.total_charge_amt || ' is <= 0',
+    '{"stg_claim_id":' || h.stg_claim_id ||
+        ',"total_charge_amt":' || h.total_charge_amt || '}'
+FROM stg_837_claim_header h
+JOIN dq_result_fact r
+  ON r.dq_rule_id    = 'DQ-08'
+ AND r.load_batch_id = h.load_batch_id
+WHERE h.total_charge_amt <= 0
+UNION ALL
+-- Line violations
+SELECT
+    NEXTVAL('dq_excep_seq'),
+    r.dq_result_id,
+    'DQ-08',
+    l.load_batch_id,
+    l.stg_claim_line_id::TEXT,
+    'Claim line line_charge_amt=' || l.line_charge_amt || ' is <= 0',
+    '{"stg_claim_line_id":' || l.stg_claim_line_id ||
+        ',"line_charge_amt":' || l.line_charge_amt || '}'
+FROM stg_837_claim_line l
+JOIN dq_result_fact r
+  ON r.dq_rule_id    = 'DQ-08'
+ AND r.load_batch_id = l.load_batch_id
+WHERE l.line_charge_amt <= 0;
+
+
+-- =============================================================================
+-- DQ-09 — FUTURE SERVICE DATES
+-- =============================================================================
+
+WITH future_claims AS (
+    SELECT stg_claim_id, claim_control_num, service_from_dt, load_batch_id
+    FROM   stg_837_claim_header
+    WHERE  service_from_dt > CURRENT_DATE
+),
+batch_counts AS (
+    SELECT  h.load_batch_id,
+            COUNT(*)          AS total_claims,
+            COUNT(f.stg_claim_id) AS future_count
+    FROM    stg_837_claim_header h
+    LEFT JOIN future_claims f USING (stg_claim_id, load_batch_id)
+    GROUP BY h.load_batch_id
+)
+INSERT INTO dq_result_fact
+    (dq_result_id, dq_rule_id, load_batch_id, run_dt,
+     total_checked, failed_count, passed_count, pass_flag, notes)
+SELECT
+    NEXTVAL('dq_result_seq'),
+    'DQ-09',
+    load_batch_id,
+    NOW(),
+    total_claims,
+    future_count,
+    total_claims - future_count,
+    future_count = 0,
+    future_count || ' claim(s) with service_from_dt in the future'
+FROM batch_counts;
+
+INSERT INTO dq_exception_detail
+    (exception_id, dq_result_id, dq_rule_id, load_batch_id,
+     record_key, exception_reason, sample_payload)
+SELECT
+    NEXTVAL('dq_excep_seq'),
+    r.dq_result_id,
+    'DQ-09',
+    h.load_batch_id,
+    h.stg_claim_id::TEXT,
+    'service_from_dt=' || h.service_from_dt ||
+        ' is in the future (run date: ' || CURRENT_DATE || ')',
+    '{"stg_claim_id":' || h.stg_claim_id ||
+        ',"claim_control_num":"' || h.claim_control_num ||
+        '","service_from_dt":"' || h.service_from_dt || '"}'
+FROM stg_837_claim_header h
+JOIN dq_result_fact r
+  ON r.dq_rule_id    = 'DQ-09'
+ AND r.load_batch_id = h.load_batch_id
+WHERE h.service_from_dt > CURRENT_DATE;
+
+
+-- =============================================================================
+-- DQ-10 — MEMBER NOT FOUND IN ELIGIBILITY
+-- =============================================================================
+
+WITH no_elig AS (
+    SELECT  h.stg_claim_id,
+            h.claim_control_num,
+            h.member_external_id,
+            h.load_batch_id
+    FROM    stg_837_claim_header h
+    LEFT JOIN stg_834_eligibility e
+           ON h.member_external_id = e.member_external_id
+    WHERE   e.member_external_id IS NULL
+),
+batch_counts AS (
+    SELECT  h.load_batch_id,
+            COUNT(*)          AS total_claims,
+            COUNT(n.stg_claim_id) AS no_elig_count
+    FROM    stg_837_claim_header h
+    LEFT JOIN no_elig n USING (stg_claim_id, load_batch_id)
+    GROUP BY h.load_batch_id
+)
+INSERT INTO dq_result_fact
+    (dq_result_id, dq_rule_id, load_batch_id, run_dt,
+     total_checked, failed_count, passed_count, pass_flag, notes)
+SELECT
+    NEXTVAL('dq_result_seq'),
+    'DQ-10',
+    load_batch_id,
+    NOW(),
+    total_claims,
+    no_elig_count,
+    total_claims - no_elig_count,
+    no_elig_count = 0,
+    no_elig_count || ' claim(s) with member_external_id not in eligibility'
+FROM batch_counts;
+
+INSERT INTO dq_exception_detail
+    (exception_id, dq_result_id, dq_rule_id, load_batch_id,
+     record_key, exception_reason, sample_payload)
+SELECT
+    NEXTVAL('dq_excep_seq'),
+    r.dq_result_id,
+    'DQ-10',
+    h.load_batch_id,
+    h.stg_claim_id::TEXT,
+    'Member ' || h.member_external_id ||
+        ' has no record in stg_834_eligibility',
+    '{"stg_claim_id":' || h.stg_claim_id ||
+        ',"member_external_id":"' || h.member_external_id || '"}'
+FROM stg_837_claim_header h
+LEFT JOIN stg_834_eligibility e
+       ON h.member_external_id = e.member_external_id
+JOIN dq_result_fact r
+  ON r.dq_rule_id    = 'DQ-10'
+ AND r.load_batch_id = h.load_batch_id
+WHERE e.member_external_id IS NULL;
+
+
+-- =============================================================================
+-- DQ-11 — INVALID ICD-10 FORMAT
+-- Must start with a letter, followed by 2 digits, optional decimal/alphanumeric
+-- Pattern: ^[A-Z][0-9]{2}[.A-Z0-9]*$  length 3-8
+-- =============================================================================
+
+WITH bad_icd AS (
+    SELECT  stg_claim_line_id,
+            stg_claim_id,
+            icd10_dx,
+            load_batch_id
+    FROM    stg_837_claim_line
+    WHERE   icd10_dx IS NOT NULL
+      AND  (icd10_dx !~ '^[A-Z][0-9]{2}[.A-Z0-9]*$'
+            OR LENGTH(icd10_dx) < 3
+            OR LENGTH(icd10_dx) > 8)
+),
+batch_counts AS (
+    SELECT  l.load_batch_id,
+            COUNT(*)          AS total_lines,
+            COUNT(b.stg_claim_line_id) AS bad_count
+    FROM    stg_837_claim_line l
+    LEFT JOIN bad_icd b USING (stg_claim_line_id, load_batch_id)
+    GROUP BY l.load_batch_id
+)
+INSERT INTO dq_result_fact
+    (dq_result_id, dq_rule_id, load_batch_id, run_dt,
+     total_checked, failed_count, passed_count, pass_flag, notes)
+SELECT
+    NEXTVAL('dq_result_seq'),
+    'DQ-11',
+    load_batch_id,
+    NOW(),
+    total_lines,
+    bad_count,
+    total_lines - bad_count,
+    bad_count = 0,
+    bad_count || ' line(s) with invalid ICD-10 format'
+FROM batch_counts;
+
+INSERT INTO dq_exception_detail
+    (exception_id, dq_result_id, dq_rule_id, load_batch_id,
+     record_key, exception_reason, sample_payload)
+SELECT
+    NEXTVAL('dq_excep_seq'),
+    r.dq_result_id,
+    'DQ-11',
+    l.load_batch_id,
+    l.stg_claim_line_id::TEXT,
+    'Invalid ICD-10: "' || l.icd10_dx ||
+        '" (must match ^[A-Z][0-9]{2}...)',
+    '{"stg_claim_line_id":' || l.stg_claim_line_id ||
+        ',"icd10_dx":"' || l.icd10_dx || '"}'
+FROM stg_837_claim_line l
+JOIN dq_result_fact r
+  ON r.dq_rule_id    = 'DQ-11'
+ AND r.load_batch_id = l.load_batch_id
+WHERE l.icd10_dx IS NOT NULL
+  AND (l.icd10_dx !~ '^[A-Z][0-9]{2}[.A-Z0-9]*$'
+       OR LENGTH(l.icd10_dx) < 3
+       OR LENGTH(l.icd10_dx) > 8);
+
+
+-- =============================================================================
+-- DQ-12 — DUPLICATE CLAIM CONTROL NUMBERS
+-- claim_control_num must be unique within a batch
+-- =============================================================================
+
+WITH dupes AS (
+    SELECT  claim_control_num,
+            load_batch_id,
+            COUNT(*)  AS dupe_count
+    FROM    stg_837_claim_header
+    GROUP BY claim_control_num, load_batch_id
+    HAVING  COUNT(*) > 1
+),
+all_dupe_rows AS (
+    SELECT  h.stg_claim_id,
+            h.claim_control_num,
+            h.load_batch_id
+    FROM    stg_837_claim_header h
+    JOIN    dupes d
+         ON h.claim_control_num = d.claim_control_num
+        AND h.load_batch_id     = d.load_batch_id
+),
+batch_counts AS (
+    SELECT  h.load_batch_id,
+            COUNT(DISTINCT h.claim_control_num)  AS total_ccns,
+            COUNT(DISTINCT d.claim_control_num)  AS dupe_ccn_count
+    FROM    stg_837_claim_header h
+    LEFT JOIN dupes d
+           ON h.claim_control_num = d.claim_control_num
+          AND h.load_batch_id     = d.load_batch_id
+    GROUP BY h.load_batch_id
+)
+INSERT INTO dq_result_fact
+    (dq_result_id, dq_rule_id, load_batch_id, run_dt,
+     total_checked, failed_count, passed_count, pass_flag, notes)
+SELECT
+    NEXTVAL('dq_result_seq'),
+    'DQ-12',
+    load_batch_id,
+    NOW(),
+    total_ccns,
+    dupe_ccn_count,
+    total_ccns - dupe_ccn_count,
+    dupe_ccn_count = 0,
+    dupe_ccn_count || ' duplicate claim_control_num(s) found in batch'
+FROM batch_counts;
+
+INSERT INTO dq_exception_detail
+    (exception_id, dq_result_id, dq_rule_id, load_batch_id,
+     record_key, exception_reason, sample_payload)
+SELECT
+    NEXTVAL('dq_excep_seq'),
+    r.dq_result_id,
+    'DQ-12',
+    h.load_batch_id,
+    h.stg_claim_id::TEXT,
+    'Duplicate claim_control_num="' || h.claim_control_num ||
+        '" appears ' ||
+        (SELECT COUNT(*) FROM stg_837_claim_header x
+         WHERE x.claim_control_num = h.claim_control_num
+           AND x.load_batch_id     = h.load_batch_id) ||
+        ' times in batch',
+    '{"stg_claim_id":' || h.stg_claim_id ||
+        ',"claim_control_num":"' || h.claim_control_num || '"}'
+FROM stg_837_claim_header h
+JOIN (
+    SELECT claim_control_num, load_batch_id
+    FROM   stg_837_claim_header
+    GROUP BY claim_control_num, load_batch_id
+    HAVING COUNT(*) > 1
+) d ON h.claim_control_num = d.claim_control_num
+   AND h.load_batch_id     = d.load_batch_id
+JOIN dq_result_fact r
+  ON r.dq_rule_id    = 'DQ-12'
+ AND r.load_batch_id = h.load_batch_id;
+
+-- =============================================================================
+-- END OF DQ ENGINE
+-- =============================================================================
