@@ -1,0 +1,25 @@
+dq_rule_id,rule_name,severity,load_batch_id,total_checked,failed_count,passed_count,status,pass_pct,notes
+DQ-01,Rowcount Reconciliation,CRITICAL,BATCH_2022_01,17,1,16,FAIL,94.1,Staging count: 17 | Curated count: 10 | Variance: 7
+DQ-01,Rowcount Reconciliation,CRITICAL,BATCH_2023_01,10,0,10,PASS,100.0,Staging count: 10 | Curated count: 10 | Variance: 0
+DQ-02,Financial Reconciliation,CRITICAL,BATCH_2022_01,17,1,16,FAIL,94.1,1 claim(s) with header vs line charge mismatch > $0.01
+DQ-02,Financial Reconciliation,CRITICAL,BATCH_2023_01,10,0,10,PASS,100.0,0 claim(s) with header vs line charge mismatch > $0.01
+DQ-10,Member Not Found in Eligibility,CRITICAL,BATCH_2022_01,17,1,16,FAIL,94.1,1 claim(s) with member_external_id not in eligibility
+DQ-10,Member Not Found in Eligibility,CRITICAL,BATCH_2023_01,10,0,10,PASS,100.0,0 claim(s) with member_external_id not in eligibility
+DQ-12,Duplicate Claim Control Numbers,CRITICAL,BATCH_2022_01,16,1,15,FAIL,93.8,1 duplicate claim_control_num(s) found in batch
+DQ-12,Duplicate Claim Control Numbers,CRITICAL,BATCH_2023_01,10,0,10,PASS,100.0,0 duplicate claim_control_num(s) found in batch
+DQ-03,Orphan Claim Lines,HIGH,BATCH_2022_01,28,2,26,FAIL,92.9,2 orphan line(s) with no matching claim header
+DQ-03,Orphan Claim Lines,HIGH,BATCH_2023_01,11,0,11,PASS,100.0,0 orphan line(s) with no matching claim header
+DQ-04,Orphan Payments,HIGH,BATCH_2022_01,12,2,10,FAIL,83.3,2 payment(s) with no matching 837 claim
+DQ-04,Orphan Payments,HIGH,BATCH_2023_01,10,0,10,PASS,100.0,0 payment(s) with no matching 837 claim
+DQ-05,Eligibility Overlap,HIGH,BATCH_2022_01,15,1,14,FAIL,93.3,1 member(s) with overlapping eligibility spans
+DQ-05,Eligibility Overlap,HIGH,BATCH_2023_01,10,0,10,PASS,100.0,0 member(s) with overlapping eligibility spans
+DQ-06,Invalid CPT/HCPCS Format,HIGH,BATCH_2022_01,28,2,26,FAIL,92.9,2 line(s) with invalid CPT/HCPCS format
+DQ-06,Invalid CPT/HCPCS Format,HIGH,BATCH_2023_01,11,0,11,PASS,100.0,0 line(s) with invalid CPT/HCPCS format
+DQ-07,Missing or Invalid NPI,HIGH,BATCH_2022_01,17,2,15,FAIL,88.2,2 claim(s) with missing or invalid NPI
+DQ-07,Missing or Invalid NPI,HIGH,BATCH_2023_01,10,0,10,PASS,100.0,0 claim(s) with missing or invalid NPI
+DQ-11,Invalid ICD-10 Format,HIGH,BATCH_2022_01,28,2,26,FAIL,92.9,2 line(s) with invalid ICD-10 format
+DQ-11,Invalid ICD-10 Format,HIGH,BATCH_2023_01,11,0,11,PASS,100.0,0 line(s) with invalid ICD-10 format
+DQ-08,Negative or Zero Charge Amounts,MEDIUM,BATCH_2022_01,17,1,16,FAIL,94.1,1 claim(s) with charge amount <= 0
+DQ-08,Negative or Zero Charge Amounts,MEDIUM,BATCH_2023_01,10,0,10,PASS,100.0,0 claim(s) with charge amount <= 0
+DQ-09,Future Service Dates,MEDIUM,BATCH_2022_01,17,1,16,FAIL,94.1,1 claim(s) with service_from_dt in the future
+DQ-09,Future Service Dates,MEDIUM,BATCH_2023_01,10,0,10,PASS,100.0,0 claim(s) with service_from_dt in the future

@@ -1,0 +1,13 @@
+dq_rule_id,rule_name,severity,total_exceptions,batches_affected
+DQ-12,Duplicate Claim Control Numbers,CRITICAL,2,1
+DQ-03,Orphan Claim Lines,HIGH,2,1
+DQ-04,Orphan Payments,HIGH,2,1
+DQ-06,Invalid CPT/HCPCS Format,HIGH,2,1
+DQ-07,Missing or Invalid NPI,HIGH,2,1
+DQ-11,Invalid ICD-10 Format,HIGH,2,1
+DQ-01,Rowcount Reconciliation,CRITICAL,1,1
+DQ-02,Financial Reconciliation,CRITICAL,1,1
+DQ-10,Member Not Found in Eligibility,CRITICAL,1,1
+DQ-05,Eligibility Overlap,HIGH,1,1
+DQ-08,Negative or Zero Charge Amounts,MEDIUM,1,1
+DQ-09,Future Service Dates,MEDIUM,1,1

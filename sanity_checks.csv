@@ -1,0 +1,6 @@
+check_name,query,expected,result,status
+Check 1: Orphan exceptions,SELECT COUNT(*) AS orphan_exceptions FROM dq_exception_detail e LEFT JOIN dq_result_fact r ON e.dq_result_id = r.dq_result_id WHERE r.dq_result_id IS NULL,0,0,PASS
+Check 2: Impossible counts,SELECT COUNT(*) AS impossible_counts FROM dq_result_fact WHERE failed_count > total_checked,0,0,PASS
+Check 3: Count mismatch,SELECT COUNT(*) AS count_mismatch FROM dq_result_fact WHERE failed_count + passed_count != total_checked,0,0,PASS
+Check 4: Inconsistent pass_flag,SELECT COUNT(*) AS inconsistent_pass_flag FROM dq_result_fact WHERE (pass_flag = TRUE AND failed_count > 0) OR (pass_flag = FALSE AND failed_count = 0),0,0,PASS
+Check 5: Rules run for BATCH_2022_01,SELECT COUNT(DISTINCT dq_rule_id) AS rules_run_batch_2022 FROM dq_result_fact WHERE load_batch_id = 'BATCH_2022_01',12,12,PASS

@@ -1,0 +1,13 @@
+dq_rule_id,rule_name,severity,batch_2022_status,batch_2022_failures,batch_2023_status,batch_2023_failures
+DQ-01,Rowcount Reconciliation,CRITICAL,FAIL,1,PASS,0
+DQ-02,Financial Reconciliation,CRITICAL,FAIL,1,PASS,0
+DQ-10,Member Not Found in Eligibility,CRITICAL,FAIL,1,PASS,0
+DQ-12,Duplicate Claim Control Numbers,CRITICAL,FAIL,1,PASS,0
+DQ-03,Orphan Claim Lines,HIGH,FAIL,2,PASS,0
+DQ-04,Orphan Payments,HIGH,FAIL,2,PASS,0
+DQ-05,Eligibility Overlap,HIGH,FAIL,1,PASS,0
+DQ-06,Invalid CPT/HCPCS Format,HIGH,FAIL,2,PASS,0
+DQ-07,Missing or Invalid NPI,HIGH,FAIL,2,PASS,0
+DQ-11,Invalid ICD-10 Format,HIGH,FAIL,2,PASS,0
+DQ-08,Negative or Zero Charge Amounts,MEDIUM,FAIL,1,PASS,0
+DQ-09,Future Service Dates,MEDIUM,FAIL,1,PASS,0
